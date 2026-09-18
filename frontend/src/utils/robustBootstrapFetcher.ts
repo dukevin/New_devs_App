@@ -18,6 +18,7 @@ export interface BootstrapFetchResult {
  * Determines the correct backend URL based on environment
  */
 function getBackendUrl(): string {
+  if (import.meta.env.VITE_BACKEND_URL) return import.meta.env.VITE_BACKEND_URL;
   // Check if we're in development
   if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
     return 'http://localhost:8000';

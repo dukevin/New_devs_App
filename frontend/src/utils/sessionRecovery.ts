@@ -1,7 +1,7 @@
 /**
  * Session Recovery Utility
  * 
- * Handles recovery of Supabase sessions from localStorage
+ * Recovers sessions through the configured authentication client.
  */
 
 import { supabase } from '../lib/supabase';
@@ -49,10 +49,11 @@ export class SessionRecovery {
     this.recoveryStartTime = Date.now();
     
     // Create a new recovery promise with timeout
+    let timeout: ReturnType<typeof setTimeout>;
     this.recoveryPromise = Promise.race([
       this.performRecovery(),
       new Promise<null>((resolve) => {
-        setTimeout(() => {
+        timeout = setTimeout(() => {
           console.log('[SessionRecovery] Recovery timeout after 10s');
           resolve(null);
         }, 10000);
@@ -63,6 +64,7 @@ export class SessionRecovery {
       const result = await this.recoveryPromise;
       return result;
     } finally {
+      clearTimeout(timeout!);
       // Clear the promise after completion
       this.recoveryPromise = null;
       this.recoveryStartTime = null;
@@ -70,83 +72,14 @@ export class SessionRecovery {
   }
   
   private async performRecovery(): Promise<Session | null> {
-    
     try {
-      console.log('[SessionRecovery] Attempting to recover session from storage...');
-      
-      // First, check if Supabase can get the session from storage
-      const { data: { session }, error } = await supabase.auth.getSession();
-      
-      if (error) {
-        console.error('[SessionRecovery] Error getting session:', error);
-        return null;
-      }
-      
-      if (session) {
-        console.log('[SessionRecovery] Session recovered successfully');
-        
-        // Verify the session is valid
-        const { data: { user }, error: userError } = await supabase.auth.getUser(session.access_token);
-        
-        if (userError || !user) {
-          console.log('[SessionRecovery] Session invalid, attempting refresh...');
-          
-          // Try to refresh the session
-          const { data: { session: refreshedSession }, error: refreshError } = 
-            await supabase.auth.refreshSession();
-          
-          if (!refreshError && refreshedSession) {
-            console.log('[SessionRecovery] Session refreshed successfully');
-            return refreshedSession;
-          } else {
-            console.error('[SessionRecovery] Failed to refresh session:', refreshError);
-            return null;
-          }
-        }
-        
-        return session;
-      }
-      
-      // If no session found, check localStorage directly as a fallback
-      console.log('[SessionRecovery] No session from getSession, checking localStorage directly...');
-      
-      const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
-      const storageKey = `sb-${supabaseUrl.split('//')[1].split('.')[0]}-auth-token`;
-      const storedData = localStorage.getItem(storageKey);
-      
-      if (storedData) {
-        try {
-          const parsed = JSON.parse(storedData);
-          
-          if (parsed?.currentSession?.refresh_token) {
-            console.log('[SessionRecovery] Found refresh token in localStorage, attempting to restore...');
-            
-            const { data: { session: restoredSession }, error: restoreError } = 
-              await supabase.auth.setSession({
-                access_token: parsed.currentSession.access_token,
-                refresh_token: parsed.currentSession.refresh_token
-              });
-            
-            if (!restoreError && restoredSession) {
-              console.log('[SessionRecovery] Session restored from localStorage');
-              return restoredSession;
-            } else {
-              console.error('[SessionRecovery] Failed to restore session:', restoreError);
-            }
-          }
-        } catch (e) {
-          console.error('[SessionRecovery] Failed to parse stored session:', e);
-        }
-      }
-      
-      console.log('[SessionRecovery] No recoverable session found');
-      return null;
+      const { data: { session } } = await supabase.auth.getSession();
+      return session;
     } catch (error) {
       console.error('[SessionRecovery] Recovery error:', error);
       return null;
     }
   }
-  
   /**
    * Ensures a session is properly persisted to localStorage
    */
@@ -154,10 +87,7 @@ export class SessionRecovery {
     try {
       console.log('[SessionRecovery] Persisting session to storage...');
       
-      await supabase.auth.setSession({
-        access_token: session.access_token,
-        refresh_token: session.refresh_token
-      });
+      await supabase.auth.setSession(session);
       
       console.log('[SessionRecovery] Session persisted successfully');
     } catch (error) {
@@ -170,9 +100,7 @@ export class SessionRecovery {
    */
   clearStoredSession(): void {
     try {
-      const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
-      const storageKey = `sb-${supabaseUrl.split('//')[1].split('.')[0]}-auth-token`;
-      localStorage.removeItem(storageKey);
+      localStorage.removeItem('base360-auth-token');
       console.log('[SessionRecovery] Stored session cleared');
     } catch (error) {
       console.error('[SessionRecovery] Failed to clear stored session:', error);

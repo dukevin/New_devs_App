@@ -39,7 +39,7 @@ class LocalAuthClient {
   }
 
   private getApiUrl(): string {
-    return import.meta.env.VITE_API_URL || import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000';
+    return import.meta.env.VITE_BACKEND_URL || import.meta.env.VITE_API_URL || 'http://localhost:8000';
   }
 
   private notifySubscribers(event: string, session: AuthSession | null) {

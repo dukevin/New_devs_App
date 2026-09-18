@@ -43,6 +43,24 @@ export class TenantIsolationError extends Error {
   }
 }
 
+export interface DashboardProperty {
+  id: string;
+  name: string;
+  timezone: string;
+}
+
+export interface DashboardRevenue {
+  property_id: string;
+  year: number;
+  month: number | null;
+  timezone: string;
+  totals: {
+    currency: string;
+    total_revenue: string;
+    reservations_count: number;
+  }[];
+}
+
 export class SecureAPIClient {
   private static instance: SecureAPIClient;
   private backendUrl: string;
@@ -541,6 +559,9 @@ export class SecureAPIClient {
     endpoint: string,
     options: RequestInit = {}
   ): Promise<T> {
+    if (options.cache === 'no-store') {
+      return this.executeRequest<T>(endpoint, options, null, false);
+    }
     const method = options.method || 'GET';
     const isGetRequest = method === 'GET';
 
@@ -1449,23 +1470,14 @@ export class SecureAPIClient {
   }
 
   // ============= DASHBOARD API =============
-  /**
-   * Get dashboard summary with optional simulation header
-   */
-  async getDashboardSummary(propertyId: string, options?: { simulatedTenant?: string, timestamp?: number }) {
-    const queryParams = new URLSearchParams({ property_id: propertyId });
-    if (options?.timestamp) {
-      queryParams.append('_t', options.timestamp.toString());
-    }
+  async getDashboardProperties() {
+    return this.request<DashboardProperty[]>('/api/v1/dashboard/properties', { cache: 'no-store' });
+  }
 
-    const requestOptions: RequestInit = {};
-    if (options?.simulatedTenant) {
-      requestOptions.headers = {
-        'X-Simulated-Tenant': options.simulatedTenant
-      };
-    }
-
-    return this.request<any>(`/api/v1/dashboard/summary?${queryParams}`, requestOptions);
+  async getDashboardSummary(propertyId: string, year: number, month?: number) {
+    const queryParams = new URLSearchParams({ property_id: propertyId, year: String(year) });
+    if (month !== undefined) queryParams.set('month', String(month));
+    return this.request<DashboardRevenue>(`/api/v1/dashboard/summary?${queryParams}`, { cache: 'no-store' });
   }
 
   async uploadCompanyLogo(logo_url: string) {

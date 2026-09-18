@@ -5,7 +5,6 @@ from typing import Optional, List
 from datetime import datetime
 import logging
 import hashlib
-import asyncio
 from ..database import supabase
 from ..models.auth import AuthenticatedUser, Permission
 from ..config import settings
@@ -19,12 +18,6 @@ security = HTTPBearer(auto_error=False)
 # Authentication cache to prevent multiple DB calls for same token
 auth_cache = {}
 CACHE_DURATION = 1800  # 30 minutes (increased from 5 minutes for better performance)
-
-
-def clear_auth_cache():
-    """Clear authentication cache"""
-    global auth_cache
-    auth_cache = {}
 
 
 def invalidate_user_cache(user_id: str):
@@ -83,7 +76,8 @@ async def authenticate_request(
     # Check cache first
     if token_hash in auth_cache:
         cached_data = auth_cache[token_hash]
-        if datetime.now().timestamp() - cached_data["timestamp"] < CACHE_DURATION:
+        now = datetime.now().timestamp()
+        if now - cached_data["timestamp"] < CACHE_DURATION and now < cached_data["expires_at"]:
             cached_user = cached_data["user"]
             # If not, force a refresh to get proper tenant isolation
             if not cached_user.tenant_id:
@@ -98,11 +92,9 @@ async def authenticate_request(
             # Remove expired cache entry
             del auth_cache[token_hash]
 
-    logger.info(f"AUTH: Starting authentication - Token hash: {token_hash}, Token preview: {token[:20]}...")
+    logger.info(f"AUTH: Starting authentication - Token hash: {token_hash}")
 
     try:
-        logger.debug(f"AUTH: Verifying token with Supabase - Token: {token[:20]}...")
-
         # Verify token - handle both Supabase tokens and custom JWT tokens
         try:
             # First try to decode as a custom JWT token.
@@ -111,7 +103,8 @@ async def authenticate_request(
                     token, 
                     settings.secret_key, 
                     algorithms=["HS256"],
-                    audience="authenticated"  # Accept tokens with aud: "authenticated"
+                    audience="authenticated",
+                    options={"require_exp": True, "require_aud": True},
                 )
                 logger.info(f"AUTH: Successfully decoded custom JWT token for {payload.get('email')}")
                 
@@ -123,6 +116,7 @@ async def authenticate_request(
                         self.app_metadata = payload.get('app_metadata', {})
                         self.user_metadata = payload.get('user_metadata', {})
                         self.raw_app_metadata = payload.get('app_metadata', {})
+                        self.tenant_id = payload.get('tenant_id')
                         
                 user = MockUser(payload)
                 
@@ -130,6 +124,12 @@ async def authenticate_request(
                 # If custom JWT fails, try Supabase auth
                 response = supabase.auth.get_user(token)
                 user = response.user
+                # get_user verified the token with Supabase before these claims are used.
+                payload = jwt.get_unverified_claims(token)
+
+            expires_at = float(payload["exp"])
+            if not expires_at > datetime.now().timestamp():
+                raise ValueError("Token expired")
                 
         except Exception as e:
             # Malformed or invalid token (e.g., wrong number of segments)
@@ -248,25 +248,12 @@ async def authenticate_request(
         logger.info(f"AUTH: User cities from users_city table: {user_cities}")
         logger.info(f"AUTH: Admin status: {is_admin} - city access will be determined by endpoint logic")
 
-        # Use the comprehensive tenant resolver
-        logger.info(f"==================== TENANT ID EXTRACTION ====================")
-        logger.info(f"User: {user.email} (ID: {user.id})")
-
-        # Use TenantResolver for comprehensive tenant resolution
-        tenant_id = await TenantResolver.resolve_tenant_id(token=token, user_id=user.id, user_email=user.email)
-
-        # If we found a tenant_id and it's not in the user's metadata, update it for next time
-        current_tenant_in_metadata = None
-        if hasattr(user, "raw_app_metadata") and user.raw_app_metadata:
-            current_tenant_in_metadata = user.raw_app_metadata.get("tenant_id")
-        elif hasattr(user, "app_metadata") and user.app_metadata:
-            current_tenant_in_metadata = user.app_metadata.get("tenant_id")
-
-        if tenant_id and current_tenant_in_metadata != tenant_id:
-            logger.info(f"Updating user metadata with tenant_id for future requests...")
-            asyncio.create_task(TenantResolver.update_user_tenant_metadata(user.id, tenant_id))
-
-        logger.info(f"==================== TENANT ID EXTRACTION END ====================")
+        tenant_id = TenantResolver.resolve_tenant_from_user({
+            "app_metadata": getattr(user, "app_metadata", {}),
+            "tenant_id": getattr(user, "tenant_id", None),
+        })
+        if not tenant_id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No tenant assigned")
 
         auth_user = AuthenticatedUser(
             id=user.id,
@@ -281,11 +268,12 @@ async def authenticate_request(
         auth_cache[token_hash] = {
             "user": auth_user,
             "timestamp": datetime.now().timestamp(),
+            "expires_at": expires_at,
         }
 
         # Clean up old cache entries (keep cache size manageable)
         current_time = datetime.now().timestamp()
-        expired_keys = [k for k, v in auth_cache.items() if current_time - v["timestamp"] > CACHE_DURATION]
+        expired_keys = [k for k, v in auth_cache.items() if current_time - v["timestamp"] > CACHE_DURATION or current_time >= v["expires_at"]]
         for key in expired_keys:
             del auth_cache[key]
 
@@ -409,121 +397,8 @@ def clear_auth_cache():
 
 
 async def verify_token_ws(token: str) -> Optional[AuthenticatedUser]:
-    """Verify JWT token for WebSocket connections using same approach as regular authentication"""
+    """Apply the same verification and tenant checks to WebSocket requests."""
     try:
-        logger.debug(f"WS_AUTH: Verifying WebSocket token - Token preview: {token[:20]}...")
-
-        # Use same Supabase verification as regular authentication
-        try:
-            response = supabase.auth.get_user(token)
-            user = response.user
-        except Exception as e:
-            logger.warning(f"WS_AUTH: Token verification failed: {e.__class__.__name__}")
-            return None
-
-        if not user:
-            logger.warning("WS_AUTH: No user found for provided token")
-            return None
-
-        # Get user permissions (same as regular auth)
-        logger.debug(f"WS_AUTH: Fetching permissions for user {user.id}")
-        permissions_response = (
-            supabase.service.table("user_permissions").select("section, action").eq("user_id", user.id).execute()
-        )
-        permissions = [Permission(**perm) for perm in permissions_response.data]
-
-        # Get user cities (same table name as regular auth)
-        logger.debug(f"WS_AUTH: Fetching cities for user {user.id}")
-        cities_response = supabase.service.table("users_city").select("city_name").eq("user_id", user.id).execute()
-        # Ensure cities are always lowercase for consistency (same as regular auth)
-        user_cities = [city["city_name"].lower() for city in cities_response.data if city.get("city_name")]
-
-        # Determine tenant role for admin fallback (same as regular auth)
-        tenant_role = None
-        tenant_ids = []
-        try:
-            tenant_role_response = (
-                supabase.service.table("user_tenants")
-                .select("tenant_id, role")
-                .eq("user_id", user.id)
-                .eq("is_active", True)
-                .execute()
-            )
-            if tenant_role_response.data:
-                tenant_ids = [row.get("tenant_id") for row in tenant_role_response.data if row.get("tenant_id")]
-                for row in tenant_role_response.data:
-                    role_value = row.get("role")
-                    if role_value:
-                        tenant_role = role_value
-                    if role_value in ("admin", "owner"):
-                        tenant_role = role_value
-                        break
-        except Exception as tenant_role_error:
-            logger.warning(f"WS_AUTH: Failed to fetch tenant role for user {user.id}: {tenant_role_error}")
-
-        # Check if user is admin (same logic as regular auth)
-        role = None
-        if hasattr(user, "raw_app_metadata") and user.raw_app_metadata:
-            role = user.raw_app_metadata.get("role")
-        elif hasattr(user, "app_metadata") and user.app_metadata:
-            role = user.app_metadata.get("role")
-
-        is_admin = user.email in ADMIN_EMAILS or role == "admin" or tenant_role == "admin"
-
-        # Get allowed cities (same logic as regular auth)
-        allowed_city_map = {}
-        if not tenant_ids and getattr(user, "tenant_id", None):
-            tenant_ids = [user.tenant_id]
-
-        if tenant_ids:
-            try:
-                result = (
-                    supabase.service.table("all_properties")
-                    .select("city")
-                    .in_("tenant_id", tenant_ids)
-                    .eq("status", "active")
-                    .execute()
-                )
-                for row in result.data or []:
-                    city = (row.get("city") or "").strip()
-                    if not city:
-                        continue
-                    key = city.lower()
-                    if key not in allowed_city_map:
-                        allowed_city_map[key] = city
-            except Exception as allowed_error:
-                logger.warning(f"WS_AUTH: Failed to resolve allowed cities for user {user.id}: {allowed_error}")
-
-        # when no active properties exist in those cities. Users explicitly assigned
-        # to cities in users_city table should keep that access regardless of properties.
-
-        # Admin users get access to all cities from properties (same as regular auth)
-        if is_admin:
-            if allowed_city_map:
-                user_cities = list(allowed_city_map.values())
-                logger.debug(f"WS_AUTH: Admin user, granted access to all cities from properties: {user_cities}")
-            else:
-                # Keep user's explicitly assigned cities even if no properties exist
-                logger.debug(f"WS_AUTH: Admin user, keeping assigned cities (no properties found): {user_cities}")
-        
-        logger.info(f"WS_AUTH: Final user cities after processing: {user_cities}")
-
-        # Use the comprehensive tenant resolver (same as regular auth)
-        logger.info(f"WS_AUTH: Resolving tenant for user {user.email}")
-        tenant_id = await TenantResolver.resolve_tenant_id(token=token, user_id=user.id, user_email=user.email)
-
-        auth_user = AuthenticatedUser(
-            id=user.id,
-            email=user.email,
-            permissions=permissions,
-            cities=user_cities,
-            is_admin=is_admin,
-            tenant_id=tenant_id,
-        )
-
-        logger.info(f"WS_AUTH: Success - {user.email} (ID: {user.id}), tenant={tenant_id}, cities={len(user_cities)}, perms={len(permissions)}")
-        return auth_user
-
-    except Exception as e:
-        logger.error(f"WS_AUTH: Failed ({type(e).__name__}): {str(e)}")
+        return await authenticate_request(HTTPAuthorizationCredentials(scheme="Bearer", credentials=token))
+    except HTTPException:
         return None
